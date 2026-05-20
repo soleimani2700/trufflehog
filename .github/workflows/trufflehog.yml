@@ -1,31 +1,43 @@
-name: TruffleHog Scan for sk_live_KEY
+# .github/workflows/scan-stripe.yml
+name: Scan for Stripe Live Keys
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
         with:
-          python-version: '3.10'
+          fetch-depth: 0
 
-      - name: Install Dependencies
+      - name: Install TruffleHog
         run: |
-          pip install -r requirements.txt
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
 
-      - name: Run TruffleHog
+      - name: Scan for Stripe Keys
         run: |
-          python trufflehog.py --regex --entropy=False --rules '{"sk_live_KEY": "sk_live_[a-zA-Z0-9]{24}"}' https://github.com/<TARGET_REPO>
+          echo "🔍 Scanning for Stripe live keys..."
+          
+          trufflehog git file://. --json --only-verified 2>/dev/null | \
+          jq -r 'select(.DetectorName == "Stripe" and (.Raw | contains("sk_live_")))' | \
+          jq -s '.' > stripe_live.json || true
+
+      - name: Show Results
+        run: |
+          if [ -s stripe_live.json ] && [ "$(cat stripe_live.json)" != "[]" ]; then
+            echo "🚨 STRIPE LIVE KEYS FOUND:"
+            cat stripe_live.json | jq '.[] | {
+              key: (.Raw | split("sk_live_")[1] | "sk_live_" + .[0:12] + "••••••••"),
+              file: .SourceMetadata.Data.Git.file,
+              commit: .SourceMetadata.Data.Git.commit[0:7],
+              author: .SourceMetadata.Data.Git.author,
+              date: .SourceMetadata.Data.Git.date
+            }'
+            exit 1  # Fail the job
+          else
+            echo "✅ No Stripe live keys found"
+          fi
