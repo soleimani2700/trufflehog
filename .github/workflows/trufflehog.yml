@@ -1,7 +1,7 @@
-name: TruffleHog Scan
+name: TruffleHog Scan for sk_live_KEY
 
 on:
-  workflow_dispatch: # برای اجرای دستی
+  workflow_dispatch: # اجرای دستی
   push:
     branches:
       - main
@@ -25,4 +25,4 @@ jobs:
 
       - name: Run TruffleHog
         run: |
-          python trufflehog.py https://github.com/<TARGET_REPO>
+          python trufflehog.py --regex --entropy=False --rules '{"sk_live_KEY": "sk_live_[a-zA-Z0-9]{24}"}' https://github.com/<TARGET_REPO>
