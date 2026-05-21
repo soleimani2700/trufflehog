@@ -1,61 +1,97 @@
-# .github/workflows/stripe-scan.yml
-name: 🔍 Stripe Live Key Scanner
+# .github/workflows/stripe-hunter.yml
+name: 🎯 Stripe Live Key Hunter
 
 on:
-  push:
-  pull_request:
+  schedule:
+    - cron: '0 */6 * * *'  # هر ۶ ساعت یکبار
   workflow_dispatch:
 
 jobs:
-  scan:
+  hunt:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout target repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # اگر می‌خوای ریپوی دیگه‌ای رو اسکن کنی:
+          # repository: target/repo
+          # token: ${{ secrets.PAT_TOKEN }}
 
-      - name: Install TruffleHog
+      - name: Install Tools
         run: |
           curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
-          trufflehog --version
+          apt-get update && apt-get install -y jq curl
 
-      - name: Scan for sk_live keys
-        id: scan
+      - name: Scan & Verify Live Keys
+        id: hunter
         run: |
-          echo "🔍 Starting scan..."
+          echo "🔍 Scanning for potential keys..."
           
-          # اسکن بدون فیلتر اولیه - همه رو بگیر
-          trufflehog git file://. --json > all_findings.json 2>&1 || true
+          # اسکن و استخراج کلیدهای خام
+          trufflehog git file://. --json --no-update > raw_scan.json 2>/dev/null || true
           
-          echo "=== RAW OUTPUT ==="
-          cat all_findings.json
+          # فیلتر فقط Stripe keys
+          cat raw_scan.json | jq -r 'select(.DetectorName == "Stripe" or .Raw | contains("sk_live_")) | .Raw' | sort -u > candidates.txt
           
-          # فیلتر Stripe live
-          if grep -q "sk_live" all_findings.json 2>/dev/null; then
-            echo "🚨 FOUND sk_live!"
-            grep "sk_live" all_findings.json | jq -s '.' > stripe_keys.json
+          echo "🧪 Found $(wc -l < candidates.txt) candidates"
+          
+          # Verify کردن کلیدها با Stripe API
+          valid_keys=()
+          while IFS= read -r key; do
+            [[ -z "$key" ]] && continue
             
-            # نمایش نتایج
-            jq '.[] | {
-              "File": .SourceMetadata.Data.Git.file,
-              "Commit": .SourceMetadata.Data.Git.commit[0:7],
-              "Key Preview": (.Raw | split("sk_live_")[1] | "sk_live_" + .[0:8] + "..."),
-              "Verified": .Verified
-            }' stripe_keys.json
+            # تست API با endpoint ایمن (account info)
+            response=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: Bearer $key" \
+              -H "Stripe-Version: 2023-10-16" \
+              https://api.stripe.com/v1/account)
             
+            http_code=$(echo "$response" | tail -n1)
+            body=$(echo "$response" | sed '$d')
+            
+            if [ "$http_code" == "200" ]; then
+              account_id=$(echo "$body" | jq -r '.id')
+              account_name=$(echo "$body" | jq -r '.settings.dashboard.display_name // "Unknown"')
+              
+              echo "✅ VALID KEY: ${key:0:15}... (Account: $account_name)"
+              valid_keys+=("$key")
+              
+              # ذخیره در فایل (موقتی)
+              echo "$key | $account_id | $account_name" >> verified_keys.txt
+            else
+              echo "❌ Invalid: ${key:0:15}... (HTTP $http_code)"
+            fi
+            
+          done < candidates.txt
+          
+          # خروجی نهایی
+          if [ ${#valid_keys[@]} -gt 0 ]; then
+            echo "🎯 FOUND ${#valid_keys[@]} LIVE KEYS!"
             echo "found=true" >> $GITHUB_OUTPUT
-            exit 1
+            echo "count=${#valid_keys[@]}" >> $GITHUB_OUTPUT
           else
-            echo "✅ No sk_live keys found"
             echo "found=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Report Summary
+      - name: Save Results Securely
+        if: steps.hunter.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-stripe-keys-${{ github.run_id }}
+          path: verified_keys.txt
+          retention-days: 1  # فقط ۱ روز نگه دار
+
+      - name: Summary Report
         if: always()
         run: |
-          if [ "${{ steps.scan.outputs.found }}" == "true" ]; then
-            echo "🚨 **ALERT: Stripe Live Keys Detected!**" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎯 Stripe Key Hunt Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.hunter.outputs.found }}" == "true" ]; then
+            echo "🚨 **${{ steps.hunter.outputs.count }} LIVE KEY(S) FOUND!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Download artifact for details (expires in 24h)" >> $GITHUB_STEP_SUMMARY
           else
-            echo "✅ **Clean - No Stripe live keys found**" >> $GITHUB_STEP_SUMMARY
+            echo "✅ No live keys detected" >> $GITHUB_STEP_SUMMARY
           fi
