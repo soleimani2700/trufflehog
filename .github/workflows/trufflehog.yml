@@ -5,14 +5,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-  schedule:
-    - cron: '0 6 * * *'  # هر روز صبح ۶
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (full history)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -20,49 +18,44 @@ jobs:
       - name: Install TruffleHog
         run: |
           curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+          trufflehog --version
 
-      - name: 🔎 Deep Scan for sk_live_ keys
+      - name: Scan for sk_live keys
         id: scan
         run: |
-          echo "::group::Running TruffleHog..."
+          echo "🔍 Starting scan..."
           
-          # اسکن کامل + فقط Stripe + verified
-          trufflehog git file://. \
-            --only-verified \
-            --json 2>/dev/null | \
-            jq -c 'select(.Raw | contains("sk_live_"))' > findings.jsonl || true
+          # اسکن بدون فیلتر اولیه - همه رو بگیر
+          trufflehog git file://. --json > all_findings.json 2>&1 || true
           
-          echo "::endgroup::"
+          echo "=== RAW OUTPUT ==="
+          cat all_findings.json
           
-          # شمارش
-          COUNT=$(wc -l < findings.jsonl | tr -d ' ')
-          echo "found=$COUNT" >> $GITHUB_OUTPUT
-          
-          if [ "$COUNT" -gt 0 ]; then
-            echo "🚨 **$COUNT STRIPE LIVE KEY(S) DETECTED**" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| File | Commit | Author | Key Preview |" >> $GITHUB_STEP_SUMMARY
-            echo "|------|--------|--------|-------------|" >> $GITHUB_STEP_SUMMARY
+          # فیلتر Stripe live
+          if grep -q "sk_live" all_findings.json 2>/dev/null; then
+            echo "🚨 FOUND sk_live!"
+            grep "sk_live" all_findings.json | jq -s '.' > stripe_keys.json
             
-            while IFS= read -r line; do
-              FILE=$(echo "$line" | jq -r '.SourceMetadata.Data.Git.file // "unknown"')
-              COMMIT=$(echo "$line" | jq -r '.SourceMetadata.Data.Git.commit[0:7] // "unknown"')
-              AUTHOR=$(echo "$line" | jq -r '.SourceMetadata.Data.Git.author // "unknown"')
-              RAW=$(echo "$line" | jq -r '.Raw // ""')
-              
-              # Mask کردن کلید
-              PREVIEW=$(echo "$RAW" | sed 's/sk_live_\(.\{8\}\).*/sk_live_\1••••••••/')
-              
-              echo "| \`$FILE\` | \`$COMMIT\` | $AUTHOR | \`$PREVIEW\` |" >> $GITHUB_STEP_SUMMARY
-              
-            done < findings.jsonl
+            # نمایش نتایج
+            jq '.[] | {
+              "File": .SourceMetadata.Data.Git.file,
+              "Commit": .SourceMetadata.Data.Git.commit[0:7],
+              "Key Preview": (.Raw | split("sk_live_")[1] | "sk_live_" + .[0:8] + "..."),
+              "Verified": .Verified
+            }' stripe_keys.json
             
+            echo "found=true" >> $GITHUB_OUTPUT
             exit 1
           else
-            echo "✅ **No Stripe live keys found**" >> $GITHUB_STEP_SUMMARY
+            echo "✅ No sk_live keys found"
+            echo "found=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: 📊 Summary
+      - name: Report Summary
         if: always()
         run: |
-          echo "Scan completed. Check Summary tab for details."
+          if [ "${{ steps.scan.outputs.found }}" == "true" ]; then
+            echo "🚨 **ALERT: Stripe Live Keys Detected!**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **Clean - No Stripe live keys found**" >> $GITHUB_STEP_SUMMARY
+          fi
